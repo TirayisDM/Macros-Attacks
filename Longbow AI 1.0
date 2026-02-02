@@ -1,0 +1,1266 @@
+// =====================================================
+// Longbow – MASTER ARCHER EDITION
+// Arrow-Type Based Combat System
+// (AI Narratives + Tooltips + Arrow Selection + Shot Techniques)
+// Version 1.0
+// =====================================================
+
+/* ---------- OPENAI CONFIGURATION ---------- */
+const OPENAI_CONFIG = {
+  apiKey: "sk-proj-",
+  model: "gpt-4o-mini",
+  maxTokens: 150,
+  temperature: 0.9
+};
+
+let sessionApiKey = "";
+
+/* ---------- OPENAI API CALL ---------- */
+async function generateNarrative(arrowType, shotType, result, damage, actorName, customization) {
+  let apiKey = OPENAI_CONFIG.apiKey || sessionApiKey;
+  
+  if (!apiKey) {
+    apiKey = await Dialog.prompt({
+      title: "OpenAI API Key Required",
+      content: `
+        <p>Enter your OpenAI API key to enable AI-generated combat narratives.</p>
+        <p style="font-size:0.9em; color:#666;">Get your key at: <a href="https://platform.openai.com/api-keys" target="_blank">platform.openai.com/api-keys</a></p>
+        <input type="password" id="api-key" style="width:100%; padding:8px; margin-top:8px;" placeholder="sk-...">
+      `,
+      callback: (html) => html.find("#api-key").val()
+    });
+    
+    if (!apiKey) {
+      console.log("No API key provided, using static flavor text");
+      return null;
+    }
+    
+    sessionApiKey = apiKey;
+  }
+
+  let customContext = "";
+  if (customization) {
+    if (customization.target) {
+      customContext += `\nTarget: ${customization.target}`;
+    }
+    if (customization.style) {
+      customContext += `\nStyle: ${customization.style}`;
+    }
+  }
+
+  const prompt = `You are a dramatic combat narrator for a D&D 5e game. Generate a vivid, 2-sentence archery description:
+
+Arrow: ${arrowType}
+Shot: ${shotType}
+Character: ${actorName}
+Result: ${result}
+${damage ? `Damage: ${damage}` : ''}${customContext}
+
+Focus on draw, aim, release, and arrow flight. Emphasize precision and archery technique. Keep it under 40 words.`;
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: OPENAI_CONFIG.model,
+        messages: [
+          { 
+            role: "system", 
+            content: "You are an expert archery narrator. Describe arrow flight, precision, and technique. Be vivid and concise. No meta-commentary." 
+          },
+          { role: "user", content: prompt }
+        ],
+        max_tokens: OPENAI_CONFIG.maxTokens,
+        temperature: OPENAI_CONFIG.temperature
+      })
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      console.error("OpenAI API Error:", error);
+      
+      if (response.status === 429) {
+        ui.notifications.warn("OpenAI rate limit reached. Using default text.");
+      } else if (response.status === 401) {
+        ui.notifications.error("Invalid OpenAI API key.");
+        sessionApiKey = "";
+      } else if (response.status === 403) {
+        ui.notifications.error("OpenAI access forbidden.");
+        sessionApiKey = "";
+      } else if (response.status === 402) {
+        ui.notifications.error("OpenAI account requires payment.");
+      } else {
+        ui.notifications.warn(`AI narrative generation failed (${response.status})`);
+      }
+      return null;
+    }
+
+    const data = await response.json();
+    return data.choices[0].message.content.trim();
+  } catch (error) {
+    console.error("Failed to generate AI narrative:", error);
+    ui.notifications.warn("AI narrative generation failed (network error)");
+    return null;
+  }
+}
+
+/* ---------- CRIT THRESHOLD DETECTION ---------- */
+function getCritThreshold(actor) {
+  let threshold = 20;
+
+  const bonusCrit = actor.system.bonuses?.critical?.threshold;
+  if (bonusCrit && Number(bonusCrit) < threshold) threshold = Number(bonusCrit);
+
+  for (const effect of actor.effects.filter(e => !e.disabled)) {
+    for (const change of effect.changes) {
+      const key = change.key.toLowerCase();
+      if (key.includes("crit") && key.includes("threshold")) {
+        const val = Number(change.value);
+        if (!isNaN(val) && val < threshold) threshold = val;
+      }
+    }
+  }
+
+  const flagCrit = actor.getFlag("dnd5e", "criticalThreshold");
+  if (flagCrit && Number(flagCrit) < threshold) threshold = Number(flagCrit);
+
+  return threshold;
+}
+
+/* ---------- SAFE FORMULA EVAL ---------- */
+async function evalFormula(formula, actor) {
+  if (!formula || formula === "0") return 0;
+  try {
+    return (await new Roll(formula, actor.getRollData()).evaluate()).total;
+  } catch {
+    return 0;
+  }
+}
+
+/* ---------- ROLL COLOR WRAPPER ---------- */
+function colorizeRoll(html, color) {
+  return `<div style="background:${color}; border-radius:4px; padding:2px;">${html}</div>`;
+}
+
+/* ---------- VALIDATION ---------- */
+if (canvas.tokens.controlled.length !== 1) {
+  ui.notifications.warn("Select exactly one token.");
+  return;
+}
+const actor = canvas.tokens.controlled[0].actor;
+
+/* ---------- FIND WEAPON ---------- */
+const weapon = actor.items.find(i =>
+  i.type === "weapon" &&
+  i.name.replace(/\s+/g, "").toLowerCase().includes("longbow")
+);
+if (!weapon) {
+  ui.notifications.error("Longbow not found.");
+  return;
+}
+
+/* ---------- CORE STATS ---------- */
+const strMod = actor.system.abilities.str.mod ?? 0;
+const dexMod = actor.system.abilities.dex.mod ?? 0;
+const prof = actor.system.attributes.prof ?? 0;
+const characterLevel = actor.system.details.level ?? 1;
+const weaponAttackBonus = Number(weapon.system.attackBonus ?? 0);
+const weaponDamageBonus = Number(weapon.system.damage?.base?.bonus ?? 0);
+
+/* ---------- AUTO BONUSES ---------- */
+const bonusSources = [];
+
+if (actor.system.bonuses?.rwak?.attack)
+  bonusSources.push({ affects: "attack", formula: actor.system.bonuses.rwak.attack });
+
+if (actor.system.bonuses?.rwak?.damage)
+  bonusSources.push({ affects: "damage", formula: actor.system.bonuses.rwak.damage });
+
+for (const effect of actor.effects.filter(e => !e.disabled)) {
+  for (const change of effect.changes) {
+    if (
+      change.key.includes("rwak") ||
+      change.key.includes("attack") ||
+      change.key.includes("damage")
+    ) {
+      bonusSources.push({
+        affects: change.key.includes("attack") ? "attack" : "damage",
+        formula: change.value
+      });
+    }
+  }
+}
+
+/* ---------- ARROW TYPE DEFINITIONS ---------- */
+const arrowTypes = {
+  broadhead: {
+    label: "Broadhead Arrow",
+    flavor: "Standard hunting arrow with wide cutting head.",
+    dice: "1d8",
+    damageType: "piercing",
+    range: "150/600",
+    normalRange: 150,
+    longRange: 600,
+    critHitMod: 0,
+    minLevel: 1,
+    tooltip: `<strong>Broadhead Arrow</strong><br>
+<em>Standard Hunting Arrow</em><br><br>
+<strong>Damage:</strong> 1d8 piercing<br>
+<strong>Range:</strong> <span style="color:#3498db; font-weight:bold;">150/600 feet</span><br>
+<strong>Crit:</strong> Normal (20)<br><br>
+<strong>Description:</strong><br>
+Standard arrows with wide cutting heads designed for hunting. Reliable damage and range. The most common arrow type.<br><br>
+<strong>Best For:</strong><br>
+- General combat<br>
+- Reliable damage<br>
+- Balanced performance`
+  },
+  bodkin: {
+    label: "Bodkin Arrow",
+    flavor: "Armor-piercing arrow with narrow steel point.",
+    dice: "1d8",
+    damageType: "piercing",
+    range: "150/600",
+    normalRange: 150,
+    longRange: 600,
+    critHitMod: -1,
+    special: "pierce",
+    minLevel: 2,
+    tooltip: `<strong>Bodkin Arrow</strong><br>
+<em>Armor-Piercing Point</em><br><br>
+<strong>Damage:</strong> 1d8 piercing<br>
+<strong>Range:</strong> <span style="color:#3498db; font-weight:bold;">150/600 feet</span><br>
+<strong>Crit:</strong> 19-20 ⭐<br>
+<strong>Special:</strong> Ignores 2 AC from armor<br><br>
+<strong>Description:</strong><br>
+Narrow steel points designed to punch through plate armor. The bodkin head concentrates force into a small area, finding gaps and piercing mail.<br><br>
+<strong>Best For:</strong><br>
+- Armored targets<br>
+- Improved critical hits<br>
+- Penetrating shots`
+  },
+  fire: {
+    label: "Fire Arrow",
+    flavor: "Cloth-wrapped arrow soaked in pitch, set ablaze before firing.",
+    dice: "1d8",
+    damageType: "fire",
+    bonusDice: "1d6",
+    bonusDamageType: "fire",
+    range: "100/400",
+    normalRange: 100,
+    longRange: 400,
+    critHitMod: 0,
+    special: "ignite",
+    minLevel: 3,
+    tooltip: `<strong>Fire Arrow</strong><br>
+<em>Flaming Projectile</em><br><br>
+<strong>Damage:</strong> 1d8 piercing + 1d6 fire<br>
+<strong>Range:</strong> <span style="color:#e74c3c; font-weight:bold;">100/400 feet</span> ⚠️<br>
+<strong>Crit:</strong> Normal (20)<br>
+<strong>Special:</strong> Ignites flammables<br><br>
+<strong>Description:</strong><br>
+Arrows wrapped in pitch-soaked cloth and set alight. The flames reduce range but add fire damage. Can ignite combustible materials.<br><br>
+<strong>Best For:</strong><br>
+- Igniting targets<br>
+- Fire damage<br>
+- Siege warfare`
+  },
+  barbed: {
+    label: "Barbed Arrow",
+    flavor: "Cruel arrow with reversed barbs that tear flesh on removal.",
+    dice: "1d6",
+    damageType: "piercing",
+    range: "150/600",
+    normalRange: 150,
+    longRange: 600,
+    critHitMod: 0,
+    special: "bleed",
+    minLevel: 4,
+    tooltip: `<strong>Barbed Arrow</strong><br>
+<em>Bleeding Broadhead</em><br><br>
+<strong>Damage:</strong> 1d6 piercing<br>
+<strong>Range:</strong> <span style="color:#3498db; font-weight:bold;">150/600 feet</span><br>
+<strong>Crit:</strong> Normal (20)<br>
+<strong>Special:</strong> Causes bleeding<br><br>
+<strong>Description:</strong><br>
+Arrows with reversed barbs that catch flesh. Lower initial damage, but causes ongoing bleeding. Removing the arrow deals additional damage.<br><br>
+<strong>Best For:</strong><br>
+- Bleeding damage over time<br>
+- Forcing difficult choices<br>
+- Weakening tough enemies`
+  },
+  flight: {
+    label: "Flight Arrow",
+    flavor: "Lightweight arrow designed for maximum distance.",
+    dice: "1d6",
+    damageType: "piercing",
+    range: "200/800",
+    normalRange: 200,
+    longRange: 800,
+    critHitMod: 1,
+    special: "range",
+    minLevel: 5,
+    tooltip: `<strong>Flight Arrow</strong><br>
+<em>Long Distance Shot</em><br><br>
+<strong>Damage:</strong> 1d6 piercing<br>
+<strong>Range:</strong> <span style="color:#27ae60; font-weight:bold;">200/800 feet</span> ⭐⭐<br>
+<strong>Crit:</strong> Only 20<br>
+<strong>Special:</strong> Extended range<br><br>
+<strong>Description:</strong><br>
+Lightweight arrows with narrow shafts for reduced air resistance. Sacrifices damage for extreme range. Perfect for distant targets.<br><br>
+<strong>Best For:</strong><br>
+- Distant enemies<br>
+- Kiting tactics<br>
+- Sniper shots`
+  },
+  explosive: {
+    label: "Alchemical Arrow",
+    flavor: "Arrow tipped with unstable alchemical compound.",
+    dice: "1d8",
+    damageType: "piercing",
+    bonusDice: "2d6",
+    bonusDamageType: "fire",
+    range: "100/400",
+    normalRange: 100,
+    longRange: 400,
+    critHitMod: 0,
+    special: "explosive",
+    minLevel: 7,
+    tooltip: `<strong>Alchemical Arrow</strong><br>
+<em>Explosive Compound</em><br><br>
+<strong>Damage:</strong> 1d8 piercing + 2d6 fire (AOE)<br>
+<strong>Range:</strong> <span style="color:#e74c3c; font-weight:bold;">100/400 feet</span> ⚠️<br>
+<strong>Crit:</strong> Normal (20)<br>
+<strong>Special:</strong> 5-foot radius explosion<br><br>
+<strong>Description:</strong><br>
+Arrows tipped with volatile alchemical compounds. On impact, explodes in a 5-foot radius. All creatures in area take fire damage (DEX save DC 13 for half).<br><br>
+<strong>Best For:</strong><br>
+- Grouped enemies<br>
+- Maximum damage<br>
+- Area denial`
+  }
+};
+
+/* ---------- SHOT TECHNIQUE DEFINITIONS ---------- */
+const shotTechniques = {
+  aimed: {
+    label: "Aimed Shot",
+    attackBonus: 2,
+    critMod: -1,
+    attacks: 1,
+    description: "Carefully aimed shot (+2 attack, crit 19-20)"
+  },
+  quick: {
+    label: "Quick Shot",
+    attackBonus: -2,
+    critMod: 0,
+    attacks: 2,
+    description: "Rapid fire (-2 attack, 2 shots)"
+  },
+  power: {
+    label: "Power Shot",
+    attackBonus: 0,
+    damageDice: "+1d8",
+    critMod: 0,
+    attacks: 1,
+    description: "Maximum draw (+1d8 damage)"
+  },
+  trick: {
+    label: "Trick Shot",
+    attackBonus: -5,
+    critMod: 0,
+    attacks: 1,
+    special: true,
+    description: "Called shot (-5 attack, special effects)"
+  },
+  volley: {
+    label: "Volley",
+    attackBonus: -5,
+    critMod: 0,
+    attacks: 3,
+    description: "Three rapid shots (-5 attack, 3 arrows)",
+    minLevel: 9
+  }
+};
+
+/* ---------- STYLED ARROW SELECTION MENU ---------- */
+let selectedMode = "normal";
+let useAI = true;
+let attacksLocked = false;
+let lockTimer = null;
+
+const dialog = new Dialog({
+  title: "Longbow — Select Arrow Type",
+  content: `
+    <link rel="stylesheet" href="https://unpkg.com/tippy.js@6/dist/tippy.css" />
+    <link rel="stylesheet" href="https://unpkg.com/tippy.js@6/themes/light-border.css" />
+    
+    <style>
+      .dialog.window-app {
+        min-width: 420px !important;
+        width: 420px !important;
+      }
+      
+      .dialog .window-content {
+        min-width: 420px !important;
+        background: linear-gradient(135deg, #2c5530 0%, #4a7c4e 50%, #2c5530 100%);
+      }
+      
+      .bow-dialog-content {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding: 6px;
+        min-width: 400px;
+        max-width: 400px;
+      }
+      
+      .ai-toggle-section {
+        background: linear-gradient(135deg, #1a3a1e 0%, #2c5530 50%, #1a3a1e 100%);
+        border-radius: 6px;
+        padding: 9px;
+        border: 1.5px solid #4a7c4e;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      
+      .ai-toggle-label {
+        font-weight: bold;
+        font-size: 16px;
+        color: #90ee90;
+        margin-bottom: 6px;
+        padding-bottom: 3px;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        text-shadow: 2px 2px 4px #000;
+        flex: 1;
+      }
+      
+      .ai-toggle-btn {
+        padding: 4px 12px;
+        border: 1.5px solid #4a7c4e;
+        background: linear-gradient(135deg, #1a3a1e 0%, #2c5530 50%, #1a3a1e 100%);
+        color: #90ee90;
+        border-radius: 4px;
+        cursor: pointer;
+        font-weight: 500;
+        font-size: 10px;
+        transition: all 0.2s;
+      }
+      
+      .ai-toggle-btn:hover {
+        transform: scale(1.05);
+        box-shadow: 0 2px 4px rgba(74, 124, 78, 0.5);
+      }
+      
+      .ai-toggle-btn.disabled {
+        background: #2a2a2a;
+        border-color: #4a4a4a;
+        color: #6a6a6a;
+      }
+      
+      .roll-mode-section {
+        background: linear-gradient(135deg, #1a3a1e 0%, #2c5530 50%, #1a3a1e 100%);
+        border-radius: 6px;
+        padding: 9px;
+        border: 1.5px solid #4a7c4e;
+      }
+      
+      .roll-mode-label {
+        font-weight: bold;
+        font-size: 16px;
+        color: #90ee90;
+        margin-bottom: 12px;
+        padding-bottom: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        text-shadow: 2px 2px 4px #000;
+      }
+      
+      .roll-mode-buttons {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 10px;
+      }
+      
+      .roll-mode-btn {
+        padding: 4px 6px;
+        border: 1.5px solid #2c5530;
+        background: #1a3a1e;
+        border-radius: 4px;
+        cursor: pointer;
+        font-weight: 500;
+        font-size: 14px;
+        transition: all 0.2s;
+        text-align: center;
+        color: #90ee90;
+      }
+      
+      .roll-mode-btn:hover {
+        background: #2c5530;
+        border-color: #4a7c4e;
+      }
+      
+      .roll-mode-btn.selected {
+        background: linear-gradient(135deg, #4a7c4e 0%, #6b9b6f 50%, #4a7c4e 100%);
+        color: #fff;
+        border-color: #90ee90;
+      }
+      
+      .arrow-category {
+        margin-bottom: 9px;
+      }
+      
+      .category-title {
+        font-weight: bold;
+        font-size: 16px;
+        color: #90ee90;
+        margin-bottom: 6px;
+        padding-bottom: 3px;
+        border-bottom: 1.5px solid #4a7c4e;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        text-shadow: 2px 2px 4px #000;
+      }
+      
+      .arrow-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 6px;
+      }
+      
+      .arrow-info {
+        border-radius: 4px;
+        padding: 6px;
+        font-size: 15px;
+        color:#0f1f11;
+        line-height: 1.3;
+        cursor: pointer;
+        transition: all 0.2s;
+        position: relative;
+        border: 1.5px solid transparent;
+        min-height: 60px;
+      }
+
+      .arrow-info.standard-card {
+        background: radial-gradient(circle at 30% 30%, #c9b896 0%, #a0896d 70%, #8b7355 100%);
+        border-color: #8b7355;
+      }
+
+      .arrow-info.special-card {
+        background: radial-gradient(circle at 30% 30%, #ffa500 0%, #ff8c00 70%, #ff6347 100%);
+        border-color: #ff6347;
+      }
+      
+      .arrow-info:hover {
+        background: radial-gradient(circle at 70% 30%, #90ee90 0%, #6b9b6f 70%, #4a7c4e 100%);
+        color: #0f1f11;
+        border: 2px solid #90ee90;
+        transform: translateY(-2px);
+        box-shadow: 0 2px 8px rgba(144, 238, 144, 0.6);
+        filter: brightness(1.2);
+      }
+      
+      .arrow-info:active {
+        transform: translateY(0px);
+      }
+      
+      .arrow-info.locked {
+        opacity: 0.5;
+        cursor: not-allowed;
+        pointer-events: none;
+        filter: grayscale(0.5);
+      }
+      
+      .arrow-info::after {
+        content: "ℹ️";
+        position: absolute;
+        top: 4px;
+        right: 4px;
+        font-size: 10px;
+        opacity: 0.8;
+      }
+      
+      .arrow-info strong {
+        font-size: 15px;
+        color: #0f1f11;
+        font-weight: bold;
+      }
+      
+      .arrow-stat {
+        display: inline-block;
+        margin-right: 9px;
+        white-space: nowrap;
+      }
+      
+      .stat-label {
+        font-weight: 300;
+        color: #1f2f21;
+      }
+      
+      .tippy-box[data-theme~='bow-arrow'] {
+        background: radial-gradient(circle at 50% 50%, #2c5530 0%, #1a3a1e 100%);
+        color: #90ee90;
+        font-size: 12px;
+        max-width: 320px;
+        border: 2px solid #4a7c4e;
+        position: relative;
+      }
+      
+      .tippy-box[data-theme~='bow-arrow'] .tippy-content {
+        padding: 12px;
+        line-height: 1.5;
+        position: relative;
+        z-index: 1;
+      }
+      
+      .tippy-box[data-theme~='bow-arrow'] strong {
+        color: #90ee90;
+      }
+      
+      .tippy-box[data-theme~='bow-arrow'] em {
+        color: #c9b896;
+      }
+      
+      .tippy-box[data-theme~='bow-arrow'] span[style*="color:#3498db"],
+      .tippy-box[data-theme~='bow-arrow'] span[style*="color:#e74c3c"],
+      .tippy-box[data-theme~='bow-arrow'] span[style*="color:#27ae60"] {
+        font-weight: bold;
+      }
+    </style>
+    
+    <script src="https://unpkg.com/@popperjs/core@2"></script>
+    <script src="https://unpkg.com/tippy.js@6"></script>
+    
+    <div class="bow-dialog-content">
+      <div class="ai-toggle-section">
+        <img src="https://assets.forge-vtt.com/682698e464a8e01c529f02a4/icons/OdysseyIcon.png"
+             style="width:40px; height:40px; object-fit:contain; border:none; outline:none; box-shadow:none; background:transparent; display:block;"
+             alt="AI Icon">
+        <span class="ai-toggle-label">AI-Generated Narratives</span>
+        <div class="ai-toggle-btn" data-ai="true">ON</div>
+      </div>
+      
+      <div class="roll-mode-section">
+        <span class="roll-mode-label">Roll Mode</span>
+        <div class="roll-mode-buttons">
+          <div class="roll-mode-btn selected" data-mode="normal">Normal</div>
+          <div class="roll-mode-btn" data-mode="adv">Advantage</div>
+          <div class="roll-mode-btn" data-mode="dis">Disadvantage</div>
+        </div>
+      </div>
+      
+      <div class="arrow-category">
+        <div class="category-title">🏹 Standard Arrows</div>
+        <div class="arrow-grid">
+          <div class="arrow-info standard-card" data-arrow="broadhead">
+            <strong>Broadhead</strong><br>
+            <span class="arrow-stat"><span class="stat-label">Dmg:</span> 1d8</span>
+            <span class="arrow-stat"><span class="stat-label">150/600</span></span>
+          </div>
+          <div class="arrow-info standard-card" data-arrow="bodkin">
+            <strong>Bodkin</strong><br>
+            <span class="arrow-stat"><span class="stat-label">Dmg:</span> 1d8</span>
+            <span class="arrow-stat"><span class="stat-label">Pierce</span></span>
+          </div>
+        </div>
+        <div class="arrow-grid" style="margin-top: 6px;">
+          <div class="arrow-info standard-card" data-arrow="barbed">
+            <strong>Barbed</strong><br>
+            <span class="arrow-stat"><span class="stat-label">Dmg:</span> 1d6</span>
+            <span class="arrow-stat"><span class="stat-label">Bleed</span></span>
+          </div>
+          <div class="arrow-info standard-card" data-arrow="flight">
+            <strong>Flight</strong><br>
+            <span class="arrow-stat"><span class="stat-label">Dmg:</span> 1d6</span>
+            <span class="arrow-stat"><span class="stat-label">200/800</span></span>
+          </div>
+        </div>
+      </div>
+      
+      <div class="arrow-category">
+        <div class="category-title">✨ Special Arrows</div>
+        <div class="arrow-grid">
+          <div class="arrow-info special-card" data-arrow="fire">
+            <strong>🔥 Fire Arrow</strong><br>
+            <span class="arrow-stat"><span class="stat-label">Dmg:</span> 1d8+1d6</span>
+            <span class="arrow-stat"><span class="stat-label">100/400</span></span>
+          </div>
+          <div class="arrow-info special-card" data-arrow="explosive">
+            <strong>💥 Alchemical</strong><br>
+            <span class="arrow-stat"><span class="stat-label">Dmg:</span> 1d8+2d6</span>
+            <span class="arrow-stat"><span class="stat-label">AOE</span></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  `,
+  buttons: {},
+  render: (html) => {
+    const initTooltips = (attempt = 1, maxAttempts = 10) => {
+      if (typeof tippy !== 'undefined') {
+        html.find('.arrow-info').each(function() {
+          const arrowKey = $(this).data('arrow');
+          const arrow = arrowTypes[arrowKey];
+          if (arrow && arrow.tooltip) {
+            try {
+              const tippyInstance = tippy(this, {
+                content: arrow.tooltip,
+                allowHTML: true,
+                theme: 'bow-arrow',
+                placement: 'right',
+                arrow: true,
+                interactive: false,
+                delay: [200, 0],
+                duration: [300, 200],
+                hideOnClick: false
+              });
+              this._tippy = Array.isArray(tippyInstance) ? tippyInstance[0] : tippyInstance;
+            } catch (e) {
+              console.warn('Failed to initialize tooltip for', arrowKey, e);
+            }
+          }
+        });
+        console.log(`✅ Tooltips initialized (attempt ${attempt})`);
+      } else if (attempt < maxAttempts) {
+        console.log(`⏳ Tippy.js not loaded yet, retrying... (attempt ${attempt})`);
+        setTimeout(() => initTooltips(attempt + 1, maxAttempts), 200);
+      } else {
+        console.warn('❌ Tippy.js failed to load');
+      }
+    };
+    
+    initTooltips();
+    
+    html.find('.arrow-info').on('click', function() {
+      if (attacksLocked) {
+        ui.notifications.warn("Attacks are locked. Please wait...");
+        return;
+      }
+      
+      if (this._tippy) {
+        this._tippy.hide();
+      }
+      
+      const arrowType = $(this).data('arrow');
+      execute(arrowType, html);
+    });
+    
+    html.find('.ai-toggle-btn').on('click', function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      useAI = !useAI;
+      $(this).text(useAI ? "ON" : "OFF");
+      $(this).toggleClass('disabled', !useAI);
+    });
+    
+    html.find('.roll-mode-btn').on('click', function() {
+      html.find('.roll-mode-btn').removeClass('selected');
+      $(this).addClass('selected');
+      selectedMode = $(this).data('mode');
+    });
+  },
+  default: "broadhead",
+  width: 420
+});
+
+dialog.render(true);
+
+/* ===================================================== 
+   EXECUTE ATTACK
+===================================================== */
+
+async function execute(arrowType, html) {
+  const arrow = arrowTypes[arrowType];
+  
+  if (arrow.minLevel && characterLevel < arrow.minLevel) {
+    ui.notifications.error(`${arrow.label} requires level ${arrow.minLevel}. You are currently level ${characterLevel}.`);
+    return;
+  }
+  
+  // Shot technique selection dialog
+  const shotSelection = await new Promise((resolve) => {
+    const shotButtons = {};
+    
+    for (const [key, shot] of Object.entries(shotTechniques)) {
+      if (!shot.minLevel || characterLevel >= shot.minLevel) {
+        shotButtons[key] = {
+          label: shot.label,
+          callback: () => resolve(key)
+        };
+      }
+    }
+    
+    new Dialog({
+      title: `${arrow.label} — Select Shot Technique`,
+      content: `
+        <style>
+          .shot-dialog {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            padding: 12px;
+          }
+          
+          .shot-option {
+            background: #f9f9f9;
+            border: 2px solid #ddd;
+            border-radius: 6px;
+            padding: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+          }
+          
+          .shot-option:hover {
+            background: #e8f8e8;
+            border-color: #4a7c4e;
+            transform: translateY(-2px);
+            box-shadow: 0 2px 6px rgba(74, 124, 78, 0.3);
+          }
+          
+          .shot-name {
+            font-weight: bold;
+            font-size: 16px;
+            color: #2c5530;
+            margin-bottom: 4px;
+          }
+          
+          .shot-desc {
+            font-size: 13px;
+            color: #666;
+            font-style: italic;
+          }
+        </style>
+        
+        <div class="shot-dialog">
+          ${Object.entries(shotTechniques).filter(([key, shot]) => !shot.minLevel || characterLevel >= shot.minLevel).map(([key, shot]) => `
+            <div class="shot-option" data-shot="${key}">
+              <div class="shot-name">${shot.label}</div>
+              <div class="shot-desc">${shot.description}</div>
+            </div>
+          `).join('')}
+        </div>
+      `,
+      buttons: shotButtons,
+      render: (html) => {
+        html.find('.shot-option').on('click', function() {
+          const shotKey = $(this).data('shot');
+          html.find(`button[data-button="${shotKey}"]`).click();
+        });
+      },
+      close: () => resolve(null)
+    }).render(true);
+  });
+  
+  if (!shotSelection) return;
+  
+  const shot = shotTechniques[shotSelection];
+  
+  // Customization dialog
+  const customization = await new Promise((resolve) => {
+    new Dialog({
+      title: `${arrow.label} - ${shot.label} — Customize`,
+      content: `
+        <style>
+          .customize-dialog {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            padding: 8px;
+          }
+          
+          .customize-section {
+            background: #f9f9f9;
+            border-radius: 6px;
+            padding: 12px;
+            border: 1.5px solid #ddd;
+          }
+          
+          .customize-label {
+            font-weight: bold;
+            font-size: 13px;
+            color: #333;
+            margin-bottom: 6px;
+            display: block;
+          }
+          
+          .helper-text {
+            font-size: 11px;
+            color: #666;
+            font-style: italic;
+            margin-bottom: 8px;
+          }
+          
+          .text-input {
+            width: 100%;
+            padding: 8px;
+            border: 1.5px solid #ddd;
+            border-radius: 4px;
+            font-size: 12px;
+            font-family: inherit;
+          }
+          
+          .text-input:focus {
+            outline: none;
+            border-color: #4a7c4e;
+          }
+          
+          .bypass-hint {
+            text-align: center;
+            font-size: 11px;
+            color: #999;
+            margin-top: 8px;
+          }
+        </style>
+        
+        <div class="customize-dialog">
+          <div class="customize-section">
+            <label class="customize-label">Target</label>
+            <div class="helper-text">Specify target for narrative flavor</div>
+            <input type="text" 
+                   class="text-input" 
+                   id="target-detail" 
+                   placeholder="e.g., 'distant orc', 'guard on tower', 'dragon's wing'">
+          </div>
+          
+          <div class="customize-section">
+            <label class="customize-label">Additional Style?</label>
+            <div class="helper-text">Add personality or flair to the shot</div>
+            <input type="text" 
+                   class="text-input" 
+                   id="style-detail" 
+                   placeholder="e.g., 'with perfect form', 'in one fluid motion', 'breathing steadily'">
+          </div>
+          
+          <div class="bypass-hint">
+            Press BYPASS to skip customization and shoot normally
+          </div>
+        </div>
+      `,
+      buttons: {
+        bypass: {
+          icon: '<i class="fas fa-forward"></i>',
+          label: "BYPASS",
+          callback: () => resolve({ 
+            target: null,
+            style: null 
+          })
+        },
+        submit: {
+          icon: '<i class="fas fa-check"></i>',
+          label: "SUBMIT",
+          callback: (html) => {
+            const target = html.find('#target-detail').val().trim();
+            const style = html.find('#style-detail').val().trim();
+            
+            resolve({
+              target: target || null,
+              style: style || null
+            });
+          }
+        }
+      },
+      default: "bypass",
+      close: () => resolve(null)
+    }).render(true);
+  });
+  
+  if (customization === null) return;
+  
+  const mode = selectedMode;
+  const numAttacks = shot.attacks || 1;
+
+  let bonusAttack = 0;
+  let bonusDamage = 0;
+
+  for (const b of bonusSources) {
+    const val = await evalFormula(b.formula, actor);
+    if (b.affects === "attack") bonusAttack += val;
+    if (b.affects === "damage") bonusDamage += val;
+  }
+
+  const shotAttackBonus = shot.attackBonus || 0;
+  const toHit = dexMod + prof + weaponAttackBonus + bonusAttack + shotAttackBonus;
+  
+  let baseDamageFormula = `${arrow.dice} + ${dexMod} + ${weaponDamageBonus} + ${bonusDamage}`;
+  if (shot.damageDice) {
+    baseDamageFormula += ` + ${shot.damageDice}`;
+  }
+  if (arrow.bonusDice) {
+    baseDamageFormula += ` + ${arrow.bonusDice}`;
+  }
+
+  const baseCritThreshold = getCritThreshold(actor);
+  const arrowCritMod = arrow.critHitMod ?? 0;
+  const shotCritMod = shot.critMod ?? 0;
+  const critThreshold = Math.max(1, baseCritThreshold + arrowCritMod + shotCritMod);
+
+  let base = "1d20";
+  if (mode === "adv") base = "2d20kh";
+  if (mode === "dis") base = "2d20kl";
+
+  // Roll attacks
+  const attacks = [];
+  for (let i = 0; i < numAttacks; i++) {
+    const attackRoll = await new Roll(`${base} + ${toHit}`).evaluate();
+    game.dice3d?.showForRoll(attackRoll);
+
+    const d20 = attackRoll.dice.find(d => d.faces === 20);
+    const natural = d20 ? Math.max(...d20.results.map(r => r.result)) : null;
+
+    const isCrit = natural !== null && natural >= critThreshold;
+    const isFumble = natural !== null && natural === 1;
+
+    let damageFormula = baseDamageFormula;
+    if (isCrit) {
+      const critDice = arrow.dice + (arrow.bonusDice ? ` + ${arrow.bonusDice}` : '') + (shot.damageDice ? ` + ${shot.damageDice}` : '');
+      damageFormula = `(${critDice})*2 + ${dexMod} + ${weaponDamageBonus} + ${bonusDamage}`;
+    }
+
+    const damageRoll = await new Roll(damageFormula).evaluate();
+    game.dice3d?.showForRoll(damageRoll);
+
+    attacks.push({
+      attackRoll,
+      damageRoll,
+      natural,
+      isCrit,
+      isFumble
+    });
+  }
+
+  // Generate AI narrative
+  let flavorText = `${arrow.flavor} ${shot.label}.`;
+  if (useAI) {
+    ui.notifications.info("Generating AI narrative...");
+    
+    const firstAttack = attacks[0];
+    let resultDesc = "normal hit";
+    if (firstAttack.isCrit) resultDesc = "critical hit";
+    if (firstAttack.isFumble) resultDesc = "miss";
+    if (numAttacks > 1) resultDesc += ` (${numAttacks} shots)`;
+    
+    const aiNarrative = await generateNarrative(
+      arrow.label,
+      shot.label,
+      resultDesc,
+      firstAttack.damageRoll.total,
+      actor.name,
+      customization
+    );
+    
+    if (aiNarrative) {
+      flavorText = aiNarrative;
+    }
+  }
+
+  // Build special effects text
+  let specialText = "";
+  
+  if (arrow.special === "pierce" && !attacks[0].isFumble) {
+    specialText = `
+    <div style="background:#d4edda; border-left: 4px solid #28a745; padding: 8px; margin: 8px 0;">
+      <strong>🎯 Armor Piercing</strong>
+      <p>The bodkin point ignores <strong>2 AC from armor</strong>.</p>
+      <p style="font-size:0.9em; color:#666;"><em>Narrow steel point finds gaps in plate and pierces mail.</em></p>
+    </div>`;
+  }
+  
+  if (arrow.special === "ignite" && !attacks[0].isFumble) {
+    specialText = `
+    <div style="background:#fff3cd; border-left: 4px solid #ffc107; padding: 8px; margin: 8px 0;">
+      <strong>🔥 Fire Arrow</strong>
+      <p>Deals <strong>+1d6 fire damage</strong>. Ignites flammable objects!</p>
+      <p style="font-size:0.9em; color:#666;"><em>The flames reduce range but add burning damage.</em></p>
+    </div>`;
+  }
+  
+  if (arrow.special === "bleed" && !attacks[0].isFumble) {
+    if (attacks[0].isCrit) {
+      specialText = `
+    <div style="background:#f8d7da; border-left: 4px solid #dc3545; padding: 8px; margin: 8px 0;">
+      <strong>🩸 Deep Barbed Wound!</strong>
+      <p>Target bleeds <strong>2d4 damage per turn</strong>!</p>
+      <p>Removing arrow requires <strong>action and DC 12 Medicine check</strong>, or deals 1d6 damage.</p>
+      <p style="font-size:0.9em; color:#666;"><em>The barbs are deeply embedded.</em></p>
+    </div>`;
+    } else {
+      specialText = `
+    <div style="background:#fff3cd; border-left: 4px solid #ffc107; padding: 8px; margin: 8px 0;">
+      <strong>🩸 Barbed Arrow</strong>
+      <p>Target bleeds <strong>1d4 damage per turn</strong>.</p>
+      <p>Removing arrow requires <strong>action and DC 10 Medicine check</strong>, or deals 1d4 damage.</p>
+      <p style="font-size:0.9em; color:#666;"><em>On crit, bleeding doubles.</em></p>
+    </div>`;
+    }
+  }
+  
+  if (arrow.special === "range" && !attacks[0].isFumble) {
+    specialText = `
+    <div style="background:#d1ecf1; border-left: 4px solid #17a2b8; padding: 8px; margin: 8px 0;">
+      <strong>📏 Flight Arrow</strong>
+      <p>Extended range: <strong>200/800 feet</strong>!</p>
+      <p style="font-size:0.9em; color:#666;"><em>Lightweight construction trades damage for extreme distance.</em></p>
+    </div>`;
+  }
+  
+  if (arrow.special === "explosive" && !attacks[0].isFumble) {
+    specialText = `
+    <div style="background:#ffd700; border-left: 4px solid #ff4500; padding: 8px; margin: 8px 0;">
+      <strong>💥 ALCHEMICAL EXPLOSION!</strong>
+      <p>All creatures in <strong>5-foot radius</strong> take <strong>2d6 fire damage</strong>!</p>
+      <p><strong>DEX save DC 13 for half damage.</strong></p>
+      <p style="font-size:0.9em; color:#666;"><em>The volatile compound detonates on impact!</em></p>
+    </div>`;
+  }
+  
+  if (shot.special && !attacks[0].isFumble) {
+    specialText += `
+    <div style="background:#e8f4f8; border-left: 4px solid #17a2b8; padding: 8px; margin: 8px 0;">
+      <strong>🎯 Trick Shot</strong>
+      <p>Special effects possible:</p>
+      <ul style="margin: 4px 0; padding-left: 20px;">
+        <li>Disarm (-5 attack penalty applied)</li>
+        <li>Pin to surface</li>
+        <li>Sever rope/strap</li>
+        <li>Shoot object from hand</li>
+      </ul>
+      <p style="font-size:0.9em; color:#666;"><em>Precision shot for creative effects.</em></p>
+    </div>`;
+  }
+
+  const sign = n => (n >= 0 ? `<span style="color:#2ecc71">+${n}</span>` : `<span style="color:#e74c3c">${n}</span>`);
+  
+  const attackMods = `
+<ul>
+  <li>DEX: ${sign(dexMod)}</li>
+  <li>Proficiency: ${sign(prof)}</li>
+  <li>Weapon: ${sign(weaponAttackBonus)}</li>
+  <li>Shot Type: ${sign(shotAttackBonus)}</li>
+  <li>Other: ${sign(bonusAttack)}</li>
+  <li><strong>Total:</strong> ${sign(toHit)}</li>
+</ul>`;
+
+  const damageMods = `
+<ul>
+  <li>Arrow: ${arrow.dice}${arrow.bonusDice ? ` + ${arrow.bonusDice}` : ''}</li>
+  ${shot.damageDice ? `<li>Power Shot: ${shot.damageDice}</li>` : ''}
+  <li>DEX: ${sign(dexMod)}</li>
+  <li>Weapon: ${sign(weaponDamageBonus)}</li>
+  <li>Other: ${sign(bonusDamage)}</li>
+</ul>`;
+
+  let customText = "";
+  if (customization && (customization.target || customization.style)) {
+    const parts = [];
+    if (customization.target) {
+      parts.push(`🎯 Target: <em>${customization.target}</em>`);
+    }
+    if (customization.style) {
+      parts.push(`✨ Style: <em>${customization.style}</em>`);
+    }
+    if (parts.length > 0) {
+      customText = `<div style="background:#f0f8ff; border-left: 3px solid #4a7c4e; padding: 6px 8px; margin: 8px 0; font-size: 0.9em;">
+        ${parts.join(' • ')}
+      </div>`;
+    }
+  }
+
+  // Build attack results HTML
+  let attacksHTML = '';
+  for (let i = 0; i < attacks.length; i++) {
+    const attack = attacks[i];
+    const shotNum = numAttacks > 1 ? ` #${i + 1}` : '';
+    
+    let critText = "";
+    if (attack.isCrit) {
+      critText = critThreshold < 20
+        ? `<p><strong>Critical Hit${shotNum} (${critThreshold}+)</strong></p>`
+        : `<p><strong>Critical Hit${shotNum} (Natural 20)</strong></p>`;
+    } else if (attack.isFumble) {
+      critText = `<p><strong style="color:#c0392b;">Critical Miss${shotNum} (Natural 1)</strong></p>`;
+    }
+    
+    attacksHTML += `
+      ${critText}
+      <h4>Attack Roll${shotNum}</h4>
+      ${colorizeRoll(
+        await attack.attackRoll.render(),
+        attack.isCrit ? "#f8d7da" : attack.isFumble ? "#d4edda" : "#eee"
+      )}
+      
+      <h4>Damage Roll${shotNum}</h4>
+      ${colorizeRoll(
+        await attack.damageRoll.render(),
+        attack.isCrit ? "#f8d7da" : "#eee"
+      )}
+      ${i < attacks.length - 1 ? '<hr style="margin: 12px 0; border-color: #ddd;">' : ''}
+    `;
+  }
+
+  const expandMods = attacks.some(a => a.isCrit || a.isFumble) ? "open" : "";
+
+  await ChatMessage.create({
+    speaker: ChatMessage.getSpeaker({ actor }),
+    content: `
+<div class="dnd5e chat-card">
+  <header class="card-header" style="display:flex; align-items:center; gap:12px; background: linear-gradient(135deg, #2c5530 0%, #4a7c4e 100%);">
+    <div>
+      <div style="font-size:1.1em; font-weight:bold; color:#90ee90; text-shadow: 2px 2px 4px #000;">${actor.name}</div>
+      <div style="font-size:1em; color:#fff;">🏹 ${arrow.label} - ${shot.label}</div>
+      <div style="font-size:0.85em; color:#c9b896;">Range: ${arrow.range} ft</div>
+    </div>
+  </header>
+
+  <div class="card-content">
+    <p><em>${flavorText}</em></p>
+    ${customText}
+    ${specialText}
+    
+    ${attacksHTML}
+
+    <details ${expandMods}>
+      <summary><strong>Attack Modifiers</strong></summary>
+      ${attackMods}
+    </details>
+
+    <details ${expandMods}>
+      <summary><strong>Damage Modifiers</strong></summary>
+      ${damageMods}
+    </details>
+  </div>
+</div>
+`
+  });
+  
+  attacksLocked = true;
+  const arrowCards = html.find('.arrow-info');
+  arrowCards.addClass('locked');
+  
+  arrowCards.each(function() {
+    if (this._tippy) {
+      this._tippy.disable();
+      this._tippy.hide();
+    }
+  });
+  
+  if (lockTimer) clearTimeout(lockTimer);
+  
+  lockTimer = setTimeout(() => {
+    attacksLocked = false;
+    arrowCards.removeClass('locked');
+    
+    arrowCards.each(function() {
+      if (this._tippy) {
+        this._tippy.enable();
+      }
+    });
+    
+    ui.notifications.info("Ready to shoot!");
+  }, 10000);
+}
