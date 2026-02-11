@@ -1,0 +1,166 @@
+// ============================================================================
+//  Player Macro — Perception Check (Tile-Based Discovery)
+//  VERSION: 1.2 (Uses GM-Defined displayName Only)
+//  Sends intent ONLY — GM handles rolls and adjudication
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// VALIDATE PLAYER TOKEN
+// ---------------------------------------------------------------------------
+if (canvas.tokens.controlled.length !== 1) {
+  ui.notifications.warn("Select exactly one token (your character).");
+  return;
+}
+
+// ---------------------------------------------------------------------------
+// GET TOKEN
+// ---------------------------------------------------------------------------
+const token = canvas.tokens.controlled[0];
+
+if (!token.actor) {
+  ui.notifications.error("Selected token has no actor!");
+  return;
+}
+
+// ---------------------------------------------------------------------------
+// PERCEPTION RANGE (IN GRID SQUARES)
+// ---------------------------------------------------------------------------
+const PERCEPTION_RANGE = 4; // 4 squares = 20 ft (5 ft grid)
+
+// ---------------------------------------------------------------------------
+// FIND NEARBY TILES
+// ---------------------------------------------------------------------------
+const nearbyTiles = canvas.tiles.placeables.filter(tile => {
+
+  const dx = Math.abs(tile.x - token.x) / canvas.grid.size;
+  const dy = Math.abs(tile.y - token.y) / canvas.grid.size;
+  const distance = Math.sqrt(dx * dx + dy * dy);
+
+  return distance <= PERCEPTION_RANGE;
+});
+
+if (nearbyTiles.length === 0) {
+  ui.notifications.info("No searchable areas nearby.");
+  return;
+}
+
+// ---------------------------------------------------------------------------
+// FILTER FOR TILES WITH PERCEPTION DATA
+// ---------------------------------------------------------------------------
+const searchableTiles = [];
+
+for (const tile of nearbyTiles) {
+
+  const perceptionData =
+    tile.document?.flags?.["active-tile-manager"]?.perceptionData;
+
+  if (!perceptionData) continue;
+
+  // Player-facing name (never use texture filename)
+  const displayName =
+    tile.document?.flags?.["active-tile-manager"]?.displayName
+    || "Unremarkable Area";
+
+  const dx = (tile.x - token.x) / canvas.grid.size;
+  const dy = (tile.y - token.y) / canvas.grid.size;
+  const distance = Math.round(Math.sqrt(dx * dx + dy * dy));
+
+  searchableTiles.push({
+    id: tile.id,
+    name: displayName,
+    distance: distance,
+    perceptionData: perceptionData
+  });
+}
+
+if (searchableTiles.length === 0) {
+  ui.notifications.info("Nothing of interest nearby.");
+  return;
+}
+
+// ---------------------------------------------------------------------------
+// SORT BY DISTANCE
+// ---------------------------------------------------------------------------
+searchableTiles.sort((a, b) => a.distance - b.distance);
+
+// ---------------------------------------------------------------------------
+// TILE SELECTION (IF MULTIPLE)
+// ---------------------------------------------------------------------------
+let selectedTile;
+
+if (searchableTiles.length === 1) {
+  selectedTile = searchableTiles[0];
+} else {
+
+  const choices = searchableTiles.map(t =>
+    `<option value="${t.id}">
+      ${t.name} (${t.distance * 5} ft away)
+     </option>`
+  ).join('');
+
+  const tileId = await Dialog.prompt({
+    title: "Perception - Choose Area to Search",
+    content: `
+      <div style="margin-bottom: 12px;">
+        <label style="font-weight: bold; display: block; margin-bottom: 6px;">
+          Select an area to examine:
+        </label>
+        <select id="tile-choice" style="width: 100%; padding: 6px;">
+          ${choices}
+        </select>
+      </div>
+    `,
+    callback: (html) => html.find("#tile-choice").val(),
+    rejectClose: false
+  });
+
+  if (!tileId) return;
+
+  selectedTile = searchableTiles.find(t => t.id === tileId);
+}
+
+// ---------------------------------------------------------------------------
+// BUILD PAYLOAD
+// ---------------------------------------------------------------------------
+const payload = {
+  actorId: token.actor.id,
+  tileId: selectedTile.id,
+  tileName: selectedTile.name,
+  distance: selectedTile.distance * 5,
+  tokenX: token.x,
+  tokenY: token.y
+};
+
+console.log("🔍 [Perception Macro] Request:", {
+  actor: token.actor.name,
+  tile: selectedTile.name,
+  distance: payload.distance
+});
+
+// ---------------------------------------------------------------------------
+// VALIDATE ACTIVECORE
+// ---------------------------------------------------------------------------
+if (!window.ActiveCore?.dispatch) {
+  ui.notifications.error("ActiveCore is not ready yet.");
+  return;
+}
+
+// ---------------------------------------------------------------------------
+// DISPATCH TO GM
+// ---------------------------------------------------------------------------
+try {
+
+  window.ActiveCore.dispatch("perceptionRequest", payload);
+
+  ui.notifications.info(
+    `${token.actor.name} examines the ${selectedTile.name}...`
+  );
+
+  console.log("🔍 [Perception Macro] Dispatch successful");
+
+} catch (error) {
+
+  ui.notifications.error("Failed to send perception request!");
+  console.error("Perception dispatch error:", error);
+
+}
