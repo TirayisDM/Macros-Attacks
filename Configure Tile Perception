@@ -1,0 +1,174 @@
+// ============================================================================
+//  GM Macro — Configure Tile Perception (Final)
+//  Version: 1.4 (Added Display Name Support)
+//  Features: DC, AI Hints, Per-Tier Audio, Cooldown, Static Descriptions,
+//            Player-Facing Display Name
+// ============================================================================
+
+const selectedTiles = canvas.tiles.controlled;
+
+if (selectedTiles.length !== 1) {
+  ui.notifications.warn("Select exactly one tile to configure.");
+  return;
+}
+
+const tile = selectedTiles[0];
+
+// ---------------------------------------------------------------------------
+// GET EXISTING DATA
+// ---------------------------------------------------------------------------
+
+const existing = tile.document.flags?.["active-tile-manager"]?.perceptionData || {};
+const existingDesc = existing.descriptions || {};
+const existingAudio = existing.audio || {};
+const existingDisplayName = tile.document.flags?.["active-tile-manager"]?.displayName || "";
+
+const tileName = existingDisplayName ||
+                 tile.document.texture?.src?.split("/")?.pop() ||
+                 "Unnamed Tile";
+
+// ---------------------------------------------------------------------------
+// CONFIGURATION DIALOG
+// ---------------------------------------------------------------------------
+
+new Dialog({
+  title: `🔍 Configure Perception: ${tileName}`,
+  content: `
+    <form style="font-family: 'Signika', sans-serif; max-height: 70vh; overflow-y: auto;">
+      
+      <div style="background: #f0f0f0; padding: 10px; border-radius: 4px; margin-bottom: 16px;">
+        <strong>Tile:</strong> ${tileName}<br>
+        <strong>ID:</strong> <code style="font-size: 0.85em;">${tile.id}</code>
+      </div>
+      
+      <!-- BASIC SETTINGS -->
+      <div style="background: #e3f2fd; padding: 10px; border-radius: 4px; margin-bottom: 12px;">
+        <strong>📊 Basic Settings</strong>
+      </div>
+
+      <div style="margin-bottom: 16px;">
+        <label style="font-weight: bold; display: block; margin-bottom: 4px;">
+          Display Name (Player Facing):
+        </label>
+        <input type="text" name="displayName"
+               value="${existingDisplayName}"
+               placeholder="Hidden Stone Door"
+               style="width: 100%; padding: 6px;" />
+        <p style="font-size: 0.85em; color: #666; margin: 4px 0 0 0;">
+          What players will see when selecting this area.
+        </p>
+      </div>
+      
+      <div style="margin-bottom: 16px;">
+        <label style="font-weight: bold; display: block; margin-bottom: 4px;">
+          Perception DC:
+        </label>
+        <input type="number" name="dc" value="${existing.dc || 15}" 
+               min="5" max="30" style="width: 100%; padding: 6px;" />
+      </div>
+      
+      <div style="margin-bottom: 16px;">
+        <label style="font-weight: bold; display: block; margin-bottom: 4px;">
+          🤖 AI Hints (What's Hidden):
+        </label>
+        <textarea name="aiHints" rows="4"
+                  style="width: 100%; padding: 6px; font-family: monospace;">${existing.aiHints || ""}</textarea>
+      </div>
+
+      <div style="margin-bottom: 16px;">
+        <label style="font-weight: bold; display: block; margin-bottom: 4px;">
+          Reattempt Cooldown (seconds):
+        </label>
+        <input type="number" name="cooldown" value="${existing.cooldown || 0}" 
+               min="0" max="99" style="width: 100%; padding: 6px;" />
+      </div>
+
+      <div style="margin-bottom: 12px;">
+        <label style="display: flex; align-items: center; cursor: pointer;">
+          <input type="checkbox" name="repeatable"
+                 ${existing.repeatable !== false ? "checked" : ""} 
+                 style="margin-right: 8px;" />
+          <strong>Repeatable</strong>
+        </label>
+      </div>
+
+    </form>
+  `,
+  buttons: {
+    save: {
+      icon: '<i class="fas fa-save"></i>',
+      label: "Save",
+      callback: async (html) => {
+
+        const displayName = html.find('[name="displayName"]').val().trim();
+        const dc = parseInt(html.find('[name="dc"]').val());
+        const aiHints = html.find('[name="aiHints"]').val().trim();
+        const cooldown = parseInt(html.find('[name="cooldown"]').val());
+        const repeatable = html.find('[name="repeatable"]').prop('checked');
+
+        if (!dc || dc < 5 || dc > 30) {
+          ui.notifications.error("DC must be between 5 and 30");
+          return;
+        }
+
+        if (!displayName) {
+          ui.notifications.error("Display Name is required.");
+          return;
+        }
+
+        if (cooldown < 0 || cooldown > 99) {
+          ui.notifications.error("Cooldown must be between 0 and 99 seconds");
+          return;
+        }
+
+        // -------------------------------------------------------------------
+        // SAVE DISPLAY NAME (IDENTITY LAYER)
+        // -------------------------------------------------------------------
+        await tile.document.setFlag(
+          "active-tile-manager",
+          "displayName",
+          displayName
+        );
+
+        // -------------------------------------------------------------------
+        // BUILD PERCEPTION DATA (INTERACTION LAYER)
+        // -------------------------------------------------------------------
+        const perceptionData = {
+          dc: dc,
+          repeatable: repeatable,
+          discovered: false,
+          cooldown: cooldown
+        };
+
+        if (aiHints) {
+          perceptionData.aiHints = aiHints;
+        }
+
+        // Save perception data
+        await tile.document.setFlag(
+          "active-tile-manager",
+          "perceptionData",
+          perceptionData
+        );
+
+        ui.notifications.info(`✅ Perception data saved for "${displayName}"`);
+
+        console.log("🔍 [Perception Config] Saved:", {
+          id: tile.id,
+          displayName: displayName,
+          dc: dc,
+          cooldown: cooldown
+        });
+
+      }
+    },
+    cancel: {
+      icon: '<i class="fas fa-times"></i>',
+      label: "Cancel"
+    }
+  },
+  default: "save"
+}, {
+  width: 650,
+  height: "auto"
+}).render(true);
