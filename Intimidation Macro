@@ -1,0 +1,64 @@
+// ============================================================================
+//  Player Macro — Intimidation (Intent Only)
+//  Uses Foundry native targeting (Option A)
+//  Sends intent ONLY — GM handles all rolls and adjudication
+// 2/11/26
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// VALIDATE PLAYER TOKEN
+// ---------------------------------------------------------------------------
+
+if (canvas.tokens.controlled.length !== 1) {
+  ui.notifications.warn("Select exactly one token (your character).");
+  return;
+}
+
+// ---------------------------------------------------------------------------
+// VALIDATE TARGET
+// ---------------------------------------------------------------------------
+
+if (game.user.targets.size !== 1) {
+  ui.notifications.warn("Target exactly one creature to intimidate.");
+  return;
+}
+
+// ---------------------------------------------------------------------------
+// COLLECT REFERENCES
+// ---------------------------------------------------------------------------
+
+const actorToken = canvas.tokens.controlled[0];
+const targetToken = [...game.user.targets][0];
+
+// ---------------------------------------------------------------------------
+// BUILD INTENT PAYLOAD (NO ROLLS, NO MATH)
+// ---------------------------------------------------------------------------
+
+const payload = {
+  actorId: actorToken.actor.id,
+  targetId: targetToken.actor.id,
+
+  // Semantic hints only (safe for players)
+  approach: "threatening",
+  displayName: actorToken.name
+};
+
+// ---------------------------------------------------------------------------
+// DISPATCH TO ACTIVECORE (PLAYER → GM)
+// IMPORTANT: Use PUBLIC ActiveCore API ONLY
+// ---------------------------------------------------------------------------
+
+if (!window.ActiveCore?.dispatch) {
+  ui.notifications.error("ActiveCore is not ready yet.");
+  return;
+}
+
+window.ActiveCore.dispatch("intimidationRequest", payload);
+
+// ---------------------------------------------------------------------------
+// PLAYER FEEDBACK
+// ---------------------------------------------------------------------------
+
+ui.notifications.info(
+  `${actorToken.name} attempts to intimidate ${targetToken.name}…`
+);
